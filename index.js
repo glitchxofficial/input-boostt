@@ -3,6 +3,10 @@
   const { findByProps } = metro;
   const FluxDispatcher = metro.common?.FluxDispatcher;
   const React = metro.common?.React;
+  // Export marker — assigned at the bottom; needed because this file is a raw
+  // IIFE that Revenge/Kettu evaluate as a module. Without module.exports the
+  // plugin object is discarded and the client can never start it.
+  const __fionaPlugin = {};
 
   const store = plugin?.storage ?? {};
   // migration & defaults — slider 0-90 is primary volume, plus full Fiona params
@@ -30,6 +34,11 @@
   if (store.stereo == null) store.stereo = true;
   if (store.enabled == null) store.enabled = true;
   if (store.clear == null) store.clear = false;
+  if (store.safe == null) store.safe = true;
+  if (store.sidetone == null) store.sidetone = false;
+  if (store.reverbType == null) store.reverbType = "hall";
+  if (store.speakSounds == null) store.speakSounds = false;
+  if (!Array.isArray(store.sounds)) store.sounds = [];
 
   const VOICE_PRESETS = { 'none': { pitch: 50, formant: 100, distortion: 0, reverb: 0 }, 'robot': { pitch: 30, formant: 80, distortion: 30, reverb: 10 }, 'chipmunk': { pitch: 75, formant: 150, distortion: 0, reverb: 5 }, 'alien': { pitch: 40, formant: 120, distortion: 20, reverb: 40 }, 'demon': { pitch: 25, formant: 70, distortion: 50, reverb: 30 }, 'giant': { pitch: 30, formant: 60, distortion: 10, reverb: 50 }, 'echo': { pitch: 50, formant: 100, distortion: 0, reverb: 70 }, 'helium': { pitch: 70, formant: 130, distortion: 0, reverb: 10 } };
   const VOICE_PROFILES = { 'auto': {}, 'Male Deep': { eqBass: 65, eqMid: 45, eqTreble: 35, gateThreshold: -45 }, 'Male Medium': { eqBass: 55, eqMid: 50, eqTreble: 45, gateThreshold: -45 }, 'Female Low': { eqBass: 50, eqMid: 55, eqTreble: 55, gateThreshold: -40 }, 'Headset Mic': { eqBass: 45, eqMid: 65, eqTreble: 55, gateThreshold: -50 }, 'Studio Mic': { eqBass: 55, eqMid: 50, eqTreble: 50, gateThreshold: -60 } };
@@ -122,6 +131,9 @@
     FionaParams.duckingEnabled = !!store.duckingEnabled;
     FionaParams.duckingReduction = Number(store.duckingReduction) ?? 10;
     FionaParams.voiceProfile = store.voiceProfile ?? 'auto';
+    FionaParams.reverbType = store.reverbType ?? 'hall';
+    FionaParams.sidetone = !!store.sidetone;
+    FionaParams.bitrate = Number(store.bitrate) ?? 512000;
     if (clear) {
       FionaParams.distortion = 0;
     } else {
@@ -140,6 +152,7 @@
   function dbToGain(db) { return Math.pow(10, db / 20); }
 
   let nativeGUM = null; let gumPatched = false; let fionaNode = null; let fionaCtx = null;
+  let micInjects = 0; let fionaDest = null;
 
   const ensureContext = async () => {
     const AC = window.AudioContext || window.webkitAudioContext;
@@ -162,7 +175,7 @@
     syncFionaFromStore();
     const p = fionaNode.parameters; const t = fionaCtx.currentTime;
     const upd = {
-      gain: dbToGain(FionaParams.masterGain),
+      gain: cfg().gain * dbToGain(FionaParams.masterGain),
       boost: dbToGain(FionaParams.inputBoost * 0.2),
       width: FionaParams.width / 100,
       pitch: Math.pow(2, (FionaParams.pitch - 50) / 25),
@@ -174,6 +187,7 @@
       formant: FionaParams.formant,
       distortion: FionaParams.distortion / 100,
       noiseReduction: FionaParams.noiseReduction / 100,
+      reverbType: FionaParams.reverbType === 'cathedral' ? 3 : FionaParams.reverbType === 'plate' ? 2 : FionaParams.reverbType === 'room' ? 1 : 0,
       ducking: FionaParams.duckingEnabled ? FionaParams.duckingReduction / 20 : 0
     };
     Object.entries(upd).forEach(([k, v]) => { try { if (p.has(k)) p.get(k).setTargetAtTime(v, t, 0.05); } catch {} });
@@ -187,6 +201,11 @@
       if (md._fionaPatched) return true;
       nativeGUM = md.getUserMedia.bind(md);
       md.getUserMedia = async (constraints) => {
+        const enabled = cfg().enabled;
+        if (!enabled) {
+          // Stop mode: return the raw mic completely untouched = speak normally.
+          return nativeGUM(constraints);
+        }
         if (constraints?.audio) constraints.audio = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
         const stream = await nativeGUM(constraints);
         if (!constraints?.audio || !cfg().enabled) return stream;
@@ -195,10 +214,12 @@
           if (!ctx) return stream;
           const source = ctx.createMediaStreamSource(stream);
           const dest = ctx.createMediaStreamDestination();
+          fionaDest = dest;
           fionaNode = new AudioWorkletNode(ctx, 'fiona-engine');
           source.connect(fionaNode); fionaNode.connect(dest);
           syncFionaFromStore(); updateFionaNode();
           logger.info("fiona injected stream, gain " + cfg().slider);
+          micInjects = (micInjects || 0) + 1;
           return dest.stream;
         } catch (e) { logger.info("fiona inject failed " + e); return stream; }
       };
@@ -210,15 +231,138 @@
 
   let patches = []; let fluxUnsub = null; const saveOrig = []; let voiceRetry = null;
 
+  // Bridge to the full-feature Fiona app: it serves EVERY parameter + the
+  // soundboard on localhost, the plugin polls and applies them live.
+  let bridgeTimer = null; let bridgeOk = false; let lastPlayNow = "";
+  const BRIDGE_URL = "http://127.0.0.1:19456/fiona";
+  const BRIDGE_INTS = ["gain","masterGain","inputBoost","width","pitch","formant","distortion","reverb","eqBass","eqMid","eqTreble","gateThreshold","noiseReduction","vadThreshold","duckingReduction","bitrate"];
+  const BRIDGE_BOOLS = ["enabled","clear","safe","raw","stereo","sidetone","speakSounds","vadEnabled","duckingEnabled"];
+  const BRIDGE_STRS = ["voiceChanger","voiceProfile","reverbType"];
+  const pollBridge = () => {
+    try {
+      fetch(BRIDGE_URL).then((r) => r.json()).then((j) => {
+        if (!j || typeof j.gain !== "number") return;
+        let changed = false;
+        for (const k of BRIDGE_INTS) {
+          if (typeof j[k] === "number" && isFinite(j[k]) && store[k] !== Math.round(j[k])) { store[k] = Math.round(j[k]); changed = true; }
+        }
+        for (const k of BRIDGE_BOOLS) {
+          if (typeof j[k] === "boolean" && store[k] !== j[k]) { store[k] = j[k]; changed = true; }
+        }
+        for (const k of BRIDGE_STRS) {
+          if (typeof j[k] === "string" && j[k] && store[k] !== j[k]) { store[k] = j[k]; changed = true; }
+        }
+        if (Array.isArray(j.sounds) && JSON.stringify(j.sounds) !== JSON.stringify(store.sounds || [])) { store.sounds = j.sounds; changed = true; }
+        if (!bridgeOk) { bridgeOk = true; logger.info("Fiona app bridge connected — " + BRIDGE_INTS.length + "+ params"); }
+        if (changed) { syncFionaFromStore(); updateFionaNode(); }
+        if (typeof j.playNow === "string" && j.playNow) {
+          if (lastPlayNow !== j.playNow) { lastPlayNow = j.playNow; playSound(j.playNow); }
+        }
+        sendHeartbeat();
+      }).catch(() => { if (bridgeOk) { bridgeOk = false; logger.info("Fiona app bridge lost"); } });
+    } catch {}
+  };
+  // report live status back to the Fiona app so its UI shows "plugin connected / gain / mic injects"
+  const sendHeartbeat = () => {
+    try {
+      fetch("http://127.0.0.1:19456/heartbeat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          t: Date.now(),
+          gain: Number(store.gain || 0),
+          enabled: !!cfg().enabled,
+          patched: !!gumPatched,
+          node: !!fionaNode,
+          injects: Number(micInjects || 0),
+          sim: Number(store.voiceProfile === "sim" ? 1 : 0)
+        })
+      }).catch(() => {});
+    } catch {}
+  };
+  const startBridge = () => { if (bridgeTimer) return; try { bridgeTimer = setInterval(pollBridge, 400); pollBridge(); } catch {} };
+  const stopBridge = () => { if (bridgeTimer) { try { clearInterval(bridgeTimer); } catch {} bridgeTimer = null; } bridgeOk = false; };
+
+  // playback for the soundboard: tries the client's audio module, else degrades
+  let speakUnsub = null; let lastSpeakAt = 0;
+  const playSound = (url) => {
+    if (!url) return false;
+    if (url.startsWith("/")) { playDeviceAudio(url); return true; }
+    try {
+      const mod = (() => {
+        try { const m = findByProps("TonePlayer", "SoundManager"); if (m) return m; } catch {}
+        try { const m = findByProps("play", "Sound"); if (m) return m; } catch {}
+        return null;
+      })();
+      for (const key of ["TonePlayer", "SoundManager", "Sound", "playSound"]) {
+        const fn = mod && typeof mod[key] === "function" ? mod[key] : null;
+        if (fn) { try { fn(url); logger.info("sound playing " + url); return true; } catch {} }
+      }
+      if (mod && typeof mod.play === "function") { try { mod.play(url); logger.info("sound playing " + url); return true; } catch {} }
+      logger.info("no usable sound module for " + url);
+      return false;
+    } catch { return false; }
+  };
+  // Play a sound served by the Fiona app straight into the outgoing mic stream.
+  const playDeviceAudio = async (url) => {
+    try {
+      const ctx = await ensureContext();
+      if (!ctx || !fionaDest) return false;
+      const res = await fetch("http://127.0.0.1:19456" + url);
+      if (!res.ok) return false;
+      const buf = await res.arrayBuffer();
+      const audioBuf = await ctx.decodeAudioData(buf);
+      const src = ctx.createBufferSource();
+      src.buffer = audioBuf;
+      src.connect(fionaNode);            // through the boost/EQ engine
+      fionaNode.connect(fionaDest);
+      src.start(0);
+      logger.info("device audio -> mic " + url);
+      return true;
+    } catch (e) { logger.info("device audio failed " + e); return false; }
+  };
+
+  const myId = () => { try { const us = metro.findByName("UserStore"); return us?.getCurrentUser?.()?.id ?? us?.getCurrentUser?.()?.userId ?? null; } catch { return null; } };
+  const fireSpeakSounds = () => {
+    try {
+      if (!cfg().speakSounds || !cfg().enabled) return;
+      const now = Date.now(); if (now - lastSpeakAt < 4000) return; lastSpeakAt = now;
+      const active = (store.sounds || []).filter((s) => s && s.speak && s.url);
+      if (!active.length) return;
+      playSound(active[0].url);
+    } catch {}
+  };
+  const hookSpeaking = () => {
+    try {
+      if (!FluxDispatcher?.subscribe || speakUnsub) return;
+      const handle = (raw) => {
+        try {
+          const e = raw?.state?.user ?? raw;
+          const who = raw?.userId ?? e?.id ?? null;
+          const mid = myId();
+          if (who && mid && who !== mid) return;
+          if (raw?.speaking === true) fireSpeakSounds();
+          else if (raw?.state?.speaking === true) fireSpeakSounds();
+        } catch {}
+      };
+      speakUnsub = FluxDispatcher.subscribe("SPEAKING", handle);
+    } catch {}
+  };
+  const stopSpeaking = () => { if (speakUnsub) { try { speakUnsub(); } catch {} speakUnsub = null; } lastSpeakAt = 0; };
+
   const applyOptions = (options) => {
     if (!options) return options;
-    if (options.encodingVoiceBitRate != null) options.encodingVoiceBitRate = cfg().bitrate;
+    const safe = store.safe !== false;
+    // safe bitrate cap: 384k is proven, 512k can be rejected by the native layer (dead mic)
+    const bitrate = safe ? Math.min(cfg().bitrate, 384000) : cfg().bitrate;
+    if (options.encodingVoiceBitRate != null) options.encodingVoiceBitRate = bitrate;
     const enc = options.audioEncoder;
     if (enc) {
-      enc.channels = cfg().stereo ? 2 : 1; enc.rate = 48000;
-      const params = { ...enc.params, usedtx: "0", useinbandfec: "0", maxaveragebitrate: String(cfg().bitrate) };
+      if (!safe) { enc.channels = cfg().stereo ? 2 : 1; enc.rate = 48000; }
+      const params = { ...enc.params, usedtx: "0", useinbandfec: "0", maxaveragebitrate: String(bitrate) };
       if (cfg().stereo) params.stereo = "1";
-      if (cfg().raw) { const off = ["nr","ns","agc","aec","cn","tx","highpass"]; for (const k of off) params[k] = "0"; }
+      // zeroing nr/ns/agc can break transmission on some builds — only when safe mode is off
+      if (!safe && cfg().raw) { const off = ["nr","ns","agc","aec","cn","tx","highpass"]; for (const k of off) params[k] = "0"; }
       enc.params = params;
     }
     if (options.fec !== undefined) options.fec = false;
@@ -244,7 +388,7 @@
           const mkSwitch = (title, key) => E(Forms.FormSwitchRow ?? Forms.FormRow, { label: title, value: !!store[key], onValueChange: (v) => { store[key] = !!v; syncFionaFromStore(); updateFionaNode(); forceUpdate(); } });
           const sliderEl = SliderComp ? E(RN.View, { style: { paddingHorizontal: 16, paddingVertical: 8 } }, E(RN.Text, { style: { color: "#fff", marginBottom: 8, fontWeight: "700" } }, "Volume: " + slider + " / 90 (" + (slider/10).toFixed(1) + "x) - " + (cfg().clear ? "CLEAN" : "DISTORTED")), E(SliderComp, { value: slider, minimumValue: 0, maximumValue: 90, step: 1, onValueChange: (v) => { const nv = Array.isArray(v) ? v[0] : v; store.gain = Math.max(0, Math.min(90, Math.round(Number(nv)))); syncFionaFromStore(); updateFionaNode(); forceUpdate(); } })) : E(Forms.FormRow, { label: `Volume: ${slider}/90` });
           const Section = Forms.FormSection || (({ children, title }) => E(RN.View, null, title ? E(RN.Text, { style: { fontWeight: "700", padding: 16 } }, title) : null, children));
-          return E(Section, { title: "Fiona Audio — Mic" }, mkSwitch("Boost enabled", "enabled"), mkSwitch("Clear audio", "clear"), sliderEl, E(Forms.FormRow, { label: "Open full Fiona panel in Plugins → Fiona Audio" }));
+          return E(Section, { title: "Fiona Audio — Mic" }, mkSwitch("Boost enabled", "enabled"), mkSwitch("Safe mode", "safe"), mkSwitch("Clear audio", "clear"), sliderEl, E(Forms.FormRow, { label: "Open full Fiona panel in Plugins → Fiona Audio" }));
         }
         const makeSection = () => E(BoostSection, null);
         const candidates = []; const tryFind = (fn) => { try { const r = fn(); if (r) candidates.push(r); } catch {} };
@@ -268,20 +412,23 @@
     voiceRetry = setInterval(() => { if (tryPatch() || ++attempts > 15) { clearInterval(voiceRetry); voiceRetry = null; } }, 1000);
   };
 
+  let floatingRetry = null;
   const createFloating = () => {
+    const tryPatch = () => {
     try {
       const RN = metro.common?.ReactNative;
-      if (!RN || !React) return false;
+      if (!RN || !React || !React.useState || !React.useReducer) return false;
       const E = React.createElement;
       const { View, Text, TouchableOpacity } = RN;
+      if (!View || !Text || !TouchableOpacity) { logger.info("floating: RN components missing"); return false; }
       let AppMod = null;
-      const tryNames = ["App", "DiscordApp", "Root", "AppRoot", "Main", "Application", "NavigationContainer", "Stack", "BottomTabBar"];
+      const tryNames = ["App", "DiscordApp", "Root", "AppRoot", "Main", "Application", "NavigationContainer", "Stack", "BottomTabBar", "MobileApp", "AppNavigator", "RootNavigator", "TabBar", "Home", "Chat", "Channel"];
       for (const n of tryNames) {
-        try { const m = metro.findByName(n, false); if (m && m.default) { AppMod = m; break; } } catch {}
-        try { const m = metro.findByDisplayName(n); if (m && m.default) { AppMod = m; break; } } catch {}
-        try { const m = metro.findByDisplayName(n, false); if (m && m.default) { AppMod = m; break; } } catch {}
+        try { const m = metro.findByName(n, false); if (m && (typeof m.default === "function" || typeof m === "function")) { AppMod = m.default ? m : { default: m }; break; } } catch {}
+        try { const m = metro.findByDisplayName(n); if (m && (typeof m.default === "function" || typeof m === "function")) { AppMod = m.default ? m : { default: m }; break; } } catch {}
+        try { const m = metro.findByDisplayName(n, false); if (m && (typeof m.default === "function" || typeof m === "function")) { AppMod = m.default ? m : { default: m }; break; } } catch {}
       }
-      if (!AppMod) try { AppMod = findByProps("App"); } catch {}
+      if (!AppMod) try { const m = findByProps("App"); if (m) AppMod = m; } catch {}
       if (!AppMod) {
         try {
           const mods = vendetta.metro.modules ?? {};
@@ -294,7 +441,7 @@
           }
         } catch {}
       }
-      if (!AppMod || typeof AppMod.default !== "function") { logger.info("floating: App not found"); return false; }
+      if (!AppMod || typeof AppMod.default !== "function") { logger.info("floating: App not found, will retry"); return false; }
       const Floating = () => {
         const [, forceUpdate] = React.useReducer((x) => x + 1, 0);
         const slider = cfg().slider;
@@ -303,23 +450,39 @@
         return E(View, { style: { position: "absolute", top: 50, right: 12, zIndex: 9999, elevation: 9999, alignItems: "flex-end" }, pointerEvents: "box-none" },
           E(TouchableOpacity, { onPress: () => setOpen(!open), activeOpacity: 0.85, style: { backgroundColor: "#0a0a0f", borderWidth: 1, borderColor: "rgba(100,40,180,0.35)", borderRadius: 100, paddingHorizontal: 14, paddingVertical: 10, flexDirection: "row", alignItems: "center" } },
             E(View, { style: { width: 10, height: 10, borderRadius: 5, backgroundColor: cfg().enabled ? "#7a3adf" : "rgba(100,40,180,0.3)", marginRight: 8 } }),
-            E(Text, { style: { color: "#fff", fontWeight: "700", fontSize: 12 } }, "Fiona"),
+            E(Text, { style: { color: "#fff", fontWeight: "700", fontSize: 12 } }, "Fiona mic"),
             E(Text, { style: { color: "rgba(180,130,255,0.7)", fontSize: 10, marginLeft: 8 } }, slider + "/90")
           ),
           open ? E(View, { style: { marginTop: 8, width: 300, backgroundColor: "#0d0d1a", borderWidth: 1, borderColor: "rgba(100,40,180,0.2)", borderRadius: 16, padding: 12 } },
-            E(Text, { style: { color: "#c8aaff", fontWeight: "700", fontSize: 13, marginBottom: 10 } }, "Fiona  same colours"),
+            E(Text, { style: { color: "#c8aaff", fontWeight: "700", fontSize: 13, marginBottom: 10 } }, "Fiona mic  same colours"),
             SliderComp ? E(View, { style: { marginBottom: 10 } }, E(Text, { style: { color: "#fff", marginBottom: 6, fontSize: 12 } }, "Volume: " + slider + " / 90"), E(SliderComp, { value: slider, minimumValue: 0, maximumValue: 90, step: 1, onValueChange: (v) => { const nv = Array.isArray(v) ? v[0] : v; store.gain = Math.max(0, Math.min(90, Math.round(Number(nv)))); syncFionaFromStore(); updateFionaNode(); forceUpdate(); } })) : E(Text, { style: { color: "#fff" } }, "Volume " + slider + "/90"),
             E(TouchableOpacity, { onPress: () => { store.clear = !store.clear; syncFionaFromStore(); updateFionaNode(); forceUpdate(); }, style: { backgroundColor: store.clear ? "rgba(100,40,180,0.25)" : "#1a1a2a", borderWidth: 1, borderColor: store.clear ? "rgba(100,40,180,0.5)" : "rgba(100,40,180,0.15)", borderRadius: 8, padding: 10, alignItems: "center", marginTop: 6 } }, E(Text, { style: { color: store.clear ? "#c8aaff" : "#aaa", fontWeight: "600" } }, store.clear ? "Clear: ON" : "Clear: OFF")),
             E(TouchableOpacity, { onPress: () => { store.enabled = !store.enabled; syncFionaFromStore(); updateFionaNode(); forceUpdate(); }, style: { backgroundColor: cfg().enabled ? "rgba(100,40,180,0.2)" : "#222", borderWidth: 1, borderColor: "rgba(100,40,180,0.2)", borderRadius: 8, padding: 10, alignItems: "center", marginTop: 6 } }, E(Text, { style: { color: cfg().enabled ? "#c8aaff" : "#888" } }, cfg().enabled ? "Boost: ON" : "Boost: OFF"))
           ) : null
         );
       };
-      const undo = patcher.after("default", AppMod, (args, ret) => {
-        try { return E(View, { style: { flex: 1 }, pointerEvents: "box-none" }, ret, E(Floating, null)); } catch { return ret; }
-      });
+      let undo = null;
+      try {
+        undo = patcher.after("default", AppMod, (args, ret) => {
+          try {
+            if (!ret) return ret;
+            return E(View, { style: { flex: 1 }, pointerEvents: "box-none" }, ret, E(Floating, null));
+          } catch { return ret; }
+        });
+      } catch (e) { logger.info("floating patch threw " + e); return false; }
       if (undo) { patches.push(undo); logger.info("floating Fiona injected"); return true; }
-    } catch (e) { logger.info("floating failed " + e); }
-    return false;
+      logger.info("floating: patch returned nothing, will retry");
+      return false;
+    } catch (e) { logger.info("floating failed " + e); return false; }
+    };
+    if (tryPatch()) return true;
+    // App module loads lazily — retry for 30s so floating appears even if enabled before first render
+    let attempts = 0;
+    if (floatingRetry) try { clearInterval(floatingRetry); } catch {}
+    floatingRetry = setInterval(() => {
+      if (tryPatch() || ++attempts > 30) { try { clearInterval(floatingRetry); } catch {} floatingRetry = null; if (attempts > 30) logger.info("floating: App not found after retries"); }
+    }, 1000);
+    return true;
   };
 
   const buildSettings = () => {
@@ -344,8 +507,10 @@
       const T = FormText || FormRow;
 
       return () => {
-        const [, forceUpdate] = React.useReducer((x) => x + 1, 0);
+        const [, fu] = React.useReducer((x) => x + 1, 0);
         const [tab, setTab] = React.useState("main");
+        const [soundName, setSoundName] = React.useState("");
+        const [soundUrl, setSoundUrl] = React.useState("");
         const SliderComp = Forms.Slider ?? Forms.FormSlider ?? (() => { try { const m = findByProps("Slider"); return m?.Slider ?? m ?? null; } catch { return null; } })() ?? RN?.Slider ?? null;
 
         const mkSlider = (id, label, min, max, val) => {
@@ -354,36 +519,65 @@
         };
         const mkSwitch = (label, key) => E(FormSwitchRow ?? FormRow, { label, value: !!store[key], onValueChange: (v) => { store[key] = !!v; syncFionaFromStore(); updateFionaNode(); forceUpdate(); } });
 
-        const TabBar = () => E(RN?.View ?? "View", { style: { flexDirection: "row", flexWrap: "wrap", padding: 8, gap: 6 } }, ["main","eq","voice","advanced","presets"].map((t) => E(FormRow, { key: t, label: t.toUpperCase(), trailing: E(RN?.View ?? "View", { style: { backgroundColor: tab === t ? "#7a3adf" : "#333", borderRadius: 6, paddingHorizontal: 10, paddingVertical: 6 } }, E(RN?.Text ?? "Text", { style: { color: "#fff", fontSize: 11 }, onPress: () => setTab(t) }, t)) })));
+        const TabBar = () => E(RN?.View ?? "View", { style: { flexDirection: "row", flexWrap: "wrap", padding: 8, gap: 6 } }, ["main","eq","voice","advanced","presets","sounds"].map((t) => E(FormRow, { key: t, label: t.toUpperCase(), trailing: E(RN?.View ?? "View", { style: { backgroundColor: tab === t ? "#7a3adf" : "#333", borderRadius: 6, paddingHorizontal: 10, paddingVertical: 6 } }, E(RN?.Text ?? "Text", { style: { color: "#fff", fontSize: 11 }, onPress: () => setTab(t) }, t)) })));
 
         let pane = null;
         if (tab === "main") {
           pane = E(RN?.View ?? "View", null,
             mkSlider("gain", "VOLUME (0-90) HIGH GAIN", 0, 90, cfg().slider),
-            mkSwitch("Boost enabled", "enabled"), mkSwitch("Clear (no distortion)", "clear"), mkSwitch("Raw mode", "raw"), mkSwitch("Stereo + max bitrate", "stereo"),
-            mkSlider("masterGain", "Master Gain", 0, 100, store.masterGain), mkSlider("inputBoost", "Pre-Amp", 0, 100, store.inputBoost), mkSlider("width", "Stereo Width", 0, 100, store.width)
+            mkSwitch("Boost enabled", "enabled"), mkSwitch("Safe mode (reliable)", "safe"), mkSwitch("Clear (no distortion)", "clear"), mkSwitch("Raw mode", "raw"), mkSwitch("Stereo + max bitrate", "stereo"),
+            mkSlider("masterGain", "Master Gain", 0, 100, store.masterGain), mkSlider("inputBoost", "Pre-Amp", 0, 100, store.inputBoost), mkSlider("width", "Stereo Width", 0, 100, store.width),
+            mkSwitch("Self-hear (sidetone)", "sidetone"), mkSwitch("Play sound when I speak", "speakSounds")
           );
         } else if (tab === "eq") {
           pane = E(RN?.View ?? "View", null, mkSlider("eqBass", "Bass", 0, 100, store.eqBass), mkSlider("eqMid", "Mid", 0, 100, store.eqMid), mkSlider("eqTreble", "Treble", 0, 100, store.eqTreble));
         } else if (tab === "voice") {
           const voiceOpts = Object.keys(VOICE_PRESETS);
           const profileOpts = Object.keys(VOICE_PROFILES);
+          const reverbOpts = ["hall", "room", "plate", "cathedral"];
           pane = E(RN?.View ?? "View", null,
             E(FormRow, { label: "Voice Type", trailing: E(RN?.Text ?? "Text", { style: { color: "#7af" } }, String(store.voiceChanger)) }),
             ...voiceOpts.map((v) => E(FormRow, { key: v, label: v, trailing: E(RN?.View ?? "View", { style: { backgroundColor: store.voiceChanger === v ? "#7a3adf" : "#333", borderRadius: 6, padding: 6 } }, E(RN?.Text ?? "Text", { style: { color: "#fff" }, onPress: () => { store.voiceChanger = v; syncFionaFromStore(); updateFionaNode(); forceUpdate(); } }, v === store.voiceChanger ? "✓" : "○")) })),
             E(FormRow, { label: "Voice Profile", trailing: E(RN?.Text ?? "Text", { style: { color: "#7af" } }, String(store.voiceProfile)) }),
             ...profileOpts.map((p) => E(FormRow, { key: p, label: p, trailing: E(RN?.View ?? "View", { style: { backgroundColor: store.voiceProfile === p ? "#7a3adf" : "#333", borderRadius: 6, padding: 6 } }, E(RN?.Text ?? "Text", { style: { color: "#fff" }, onPress: () => { store.voiceProfile = p; const prof = VOICE_PROFILES[p]; if (prof) { Object.keys(prof).forEach((k) => { store[k] = prof[k]; }); } syncFionaFromStore(); updateFionaNode(); forceUpdate(); } }, p === store.voiceProfile ? "✓" : "○")) })),
-            mkSlider("pitch", "Pitch", 0, 100, store.pitch), mkSlider("formant", "Formant", 50, 200, store.formant), mkSlider("distortion", "Distortion", 0, 100, store.distortion), mkSlider("reverb", "Reverb", 0, 100, store.reverb)
+            mkSlider("pitch", "Pitch", 0, 100, store.pitch), mkSlider("formant", "Formant", 50, 200, store.formant), mkSlider("distortion", "Distortion", 0, 100, store.distortion), mkSlider("reverb", "Reverb", 0, 100, store.reverb),
+            E(FormRow, { label: "Reverb Type", trailing: E(RN?.Text ?? "Text", { style: { color: "#7af" } }, String(store.reverbType)) }),
+            ...reverbOpts.map((r) => E(FormRow, { key: r, label: "   " + r, trailing: E(RN?.View ?? "View", { style: { backgroundColor: store.reverbType === r ? "#7a3adf" : "#333", borderRadius: 6, padding: 6 } }, E(RN?.Text ?? "Text", { style: { color: "#fff" }, onPress: () => { store.reverbType = r; syncFionaFromStore(); updateFionaNode(); forceUpdate(); } }, store.reverbType === r ? "✓" : "○")) }))
           );
         } else if (tab === "advanced") {
           pane = E(RN?.View ?? "View", null,
             mkSlider("gateThreshold", "Gate Threshold", -60, 0, store.gateThreshold),
             mkSlider("noiseReduction", "Noise Reduction", 0, 100, store.noiseReduction),
             mkSwitch("VAD", "vadEnabled"), mkSlider("vadThreshold", "VAD Threshold", -60, 0, store.vadThreshold),
-            mkSwitch("Audio Ducking", "duckingEnabled"), mkSlider("duckingReduction", "Duck Amount", 0, 30, store.duckingReduction)
+            mkSwitch("Audio Ducking", "duckingEnabled"), mkSlider("duckingReduction", "Duck Amount", 0, 30, store.duckingReduction),
+            mkSlider("bitrate", "Bitrate (kbps)", 64000, 512000, store.bitrate), mkSwitch("Self-hear (sidetone)", "sidetone")
           );
         } else if (tab === "presets") {
-          pane = E(RN?.View ?? "View", null, ...Object.keys(PRESETS).map((n) => E(FormRow, { key: n, label: n, onPress: () => { const defs = { masterGain:0,inputBoost:0,width:0,pitch:50,reverb:0,eqBass:50,eqMid:50,eqTreble:50,gateThreshold:-40,formant:100,distortion:0,noiseReduction:0 }; Object.assign(store, defs, PRESETS[n]); syncFionaFromStore(); updateFionaNode(); forceUpdate(); } })));
+          pane = E(RN?.View ?? "View", null, ...Object.keys(PRESETS).map((n) => E(FormRow, { key: n, label: n, onPress: () => { const defs = { masterGain:0,inputBoost:0,width:0,pitch:50,reverb:0,reverbType:"hall",eqBass:50,eqMid:50,eqTreble:50,gateThreshold:-40,formant:100,distortion:0,noiseReduction:0 }; Object.assign(store, defs, PRESETS[n]); syncFionaFromStore(); updateFionaNode(); forceUpdate(); } })));
+        } else if (tab === "sounds") {
+          const TextInput = Forms.FormInput ?? RN?.TextInput ?? null;
+          const addSound = () => {
+            const u = String(soundUrl || "").trim(); if (!u) return;
+            const n = String(soundName || "").trim() || ("sound " + ((store.sounds?.length ?? 0) + 1));
+            if (!Array.isArray(store.sounds)) store.sounds = [];
+            store.sounds.push({ name: n, url: u, speak: false });
+            setSoundName(""); setSoundUrl(""); syncFionaFromStore(); forceUpdate();
+          };
+          const doPlay = (s) => { const ok = playSound(s.url); if (!ok) { try { const L = findByProps("Linking"); const link = L?.default ?? L?.Linking; if (link?.openURL) link.openURL(s.url); } catch {} } };
+          pane = E(RN?.View ?? "View", null,
+            E(T, { style: { paddingHorizontal: 16, paddingTop: 8, color: "#aaa" } }, "Soundboard: add sound URLs, then tap ▶ to play, or SPEAK to auto-play when you talk (must enable 'Play sound when I speak')."),
+            TextInput ? E(RN?.View ?? "View", { style: { paddingHorizontal: 16 } },
+              E(TextInput, { placeholder: "Sound name", placeholderTextColor: "#777", style: { color: "#fff", backgroundColor: "#1a1a2a", borderRadius: 8, padding: 10, marginTop: 6 }, value: soundName, onChangeText: setSoundName }),
+              E(TextInput, { placeholder: "https://example.com/sound.mp3", placeholderTextColor: "#777", style: { color: "#fff", backgroundColor: "#1a1a2a", borderRadius: 8, padding: 10, marginTop: 6 }, value: soundUrl, onChangeText: setSoundUrl }),
+              E(FormRow, { label: "ADD SOUND", onPress: addSound })
+            ) : null,
+            ...(store.sounds || []).map((s, i) => E(FormRow, { key: i, label: s.name || s.url,
+              trailing: E(RN?.View ?? "View", { style: { flexDirection: "row", alignItems: "center" } },
+                E(RN?.Text ?? "Text", { style: { color: "#7af", marginRight: 10 }, onPress: () => doPlay(s) }, "▶"),
+                E(RN?.Text ?? "Text", { style: { color: s.speak ? "#7a3adf" : "#777", marginRight: 10 }, onPress: () => { s.speak = !s.speak; syncFionaFromStore(); forceUpdate(); } }, s.speak ? "SPEAK ON" : "speak"),
+                E(RN?.Text ?? "Text", { style: { color: "#f66" }, onPress: () => { (store.sounds || []).splice(i, 1); syncFionaFromStore(); forceUpdate(); } }, "✕"))
+            }))
+          );
         }
 
         return E(RN?.ScrollView ? RN.ScrollView : RN?.View ?? "View", { style: { flex: 1 } },
@@ -395,14 +589,16 @@
     } catch (e) { logger.info("settings build failed " + e); return () => null; }
   };
 
-  return {
+  const obj = {
     onLoad() {
       try { logger.info("Fiona Audio plugin starting"); } catch {}
       try { patchGetUserMedia(); } catch (e) { try { logger.info("gum failed " + e); } catch {} }
+      try { startBridge(); } catch (e) { try { logger.info("bridge start failed " + e); } catch {} }
       try { hookTransport(); } catch (e) { try { logger.info("transport failed " + e); } catch {} }
       try { hookFlux(); } catch (e) { try { logger.info("flux failed " + e); } catch {} }
       try { patchMicSettings(); } catch (e) { try { logger.info("mic patch failed " + e); } catch {} }
       try { createFloating(); } catch (e) { try { logger.info("floating failed " + e); } catch {} }
+      try { hookSpeaking(); } catch (e) { try { logger.info("speaking failed " + e); } catch {} }
       try { syncFionaFromStore(); } catch {}
       try { updateFionaNode(); } catch {}
       try { logger.info("Fiona Audio ready — slider " + cfg().slider); } catch {}
@@ -410,6 +606,9 @@
     onUnload() {
       for (const u of patches) try { u(); } catch {}
       patches = []; if (voiceRetry) { try { clearInterval(voiceRetry); } catch {} voiceRetry = null; }
+      if (floatingRetry) { try { clearInterval(floatingRetry); } catch {} floatingRetry = null; }
+      try { stopBridge(); } catch {}
+      try { stopSpeaking(); } catch {}
       if (fluxUnsub) try { fluxUnsub(); } catch {} fluxUnsub = null;
       for (const r of saveOrig) try { r(); } catch {} saveOrig.length = 0;
       if (gumPatched && nativeGUM) { try { const nav = (typeof navigator !== 'undefined' ? navigator : null) ?? window?.navigator ?? global?.navigator ?? null; if (nav?.mediaDevices) nav.mediaDevices.getUserMedia = nativeGUM; } catch {} nativeGUM = null; gumPatched = false; }
@@ -418,4 +617,8 @@
     },
     settings: buildSettings(),
   };
+  Object.assign(__fionaPlugin, obj);
+  if (typeof module !== "undefined" && module.exports) {
+    try { module.exports = __fionaPlugin; module.exports.default = __fionaPlugin; } catch {}
+  }
 })()

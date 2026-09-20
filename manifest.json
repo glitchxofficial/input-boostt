@@ -1,19 +1,12 @@
 {
-  "format": 1,
-  "id": "com.fiona.patch",
-  "name": "Fiona Patch",
-  "description": "Native patch for Kettu/Revenge — hooks Discord app at Android level to allow floating Fiona overlay and max audio boost. Same colours #0a0a0f / #7a3adf, 0-90 slider.",
-  "author": "Fiona",
-  "version": "1.0.0",
-  "dependencies": {
-    "revenge.api": { "version": ">=1" },
-    "discord": { "version": "*" }
-  },
-  "dist": {
-    "script": "index.js",
-    "android": {
-      "path": "plugin.jar",
-      "class": "com.fiona.patch.FionaPatch"
-    }
-  }
+    "name":  "Fiona Audio",
+    "description":  "Full Fiona Audio for Kettu/Revenge - Fiona worklet engine (gain, distortion, EQ, voice, reverb, presets) with 0-90 volume slider. High gain/distortion up to 90.",
+    "authors":  [
+                    {
+                        "name":  "InputBoost",
+                        "id":  "0"
+                    }
+                ],
+    "main":  "index.js",
+    "hash": "12572BBBF4F8CE874CC46DE593496E48F10EEA89"
 }
