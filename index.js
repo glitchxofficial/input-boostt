@@ -228,6 +228,57 @@ plugin = (() => {
 
   let patches = []; let fluxUnsub = null; const saveOrig = []; let voiceRetry = null;
 
+  // The client's native voice pipeline keeps its own suppression/echo/AGC on
+  // even when our processed stream is injected — that chops the boosted mic.
+  // Finds VoiceEngine-style modules and forces those flags OFF, keeping them off.
+  const SUPPRESSION_METHODS = ["setNoiseSuppression","setNoiseSuppressionEnabled","setNoiseSuppressionDisabled","setNoiseCancellation","setNoiseCancellationEnabled","setEnableNoiseSuppression","setEnableNoiseCancellation","setEchoCancellation","setEchoCancellationEnabled","setEnableEchoCancellation","setAutoGainControl","setAutomaticGain","setAgcEnabled","setEnableAutoGainControl"];
+  const suppressUnpatch = []; let suppressRetry = null;
+  const findSuppressionModules = () => {
+    const found = [];
+    const scan = (fn) => {
+      try {
+        const r = fn(); if (!r) return;
+        const keys = typeof r === "object" ? Object.keys(r) : [];
+        for (const m of SUPPRESSION_METHODS) {
+          if (typeof r[m] === "function" || keys.includes(m)) { found.push(r); break; }
+        }
+      } catch {}
+    };
+    for (const pr of ["setNoiseSuppression","setNoiseSuppressionEnabled","setEchoCancellation","setEchoCancellationEnabled","setAutoGainControl","setAgcEnabled","VoiceEngine","NativeVoiceEngine"]) { try { scan(() => findByProps(pr)); } catch {} }
+    try { scan(() => metro.findByName("VoiceEngine", false)); scan(() => metro.findByName("NativeVoiceEngine", false)); } catch {}
+    try {
+      const nn = metro.common?.NativeModules ?? (() => { try { return findByProps("NativeModules")?.NativeModules ?? null; } catch { return null; } })();
+      if (nn) for (const k in nn) { if (/voice|audio/i.test(k)) { try { scan(() => nn[k]); } catch {} } }
+    } catch {}
+    return found;
+  };
+  const applySuppressionOff = (mod) => {
+    try {
+      for (const m of SUPPRESSION_METHODS) { try { mod[m]?.(false); } catch {} }
+      try { mod.setNoiseSuppressionDisabled?.(); } catch {}
+    } catch {}
+  };
+  const forceSuppressionOff = () => {
+    try {
+      const mods = findSuppressionModules(); if (!mods.length) return;
+      for (const mod of mods) {
+        for (const m of SUPPRESSION_METHODS) {
+          try { if (typeof mod[m] === "function") { const undo = patcher.before(m, mod, (a) => { if (Array.isArray(a) && a.length) a[0] = false; }); if (undo) suppressUnpatch.push(undo); } } catch {}
+        }
+        applySuppressionOff(mod);
+      }
+      if (!suppressRetry) {
+        let n = 0;
+        suppressRetry = setInterval(() => {
+          try { for (const mod of mods) applySuppressionOff(mod); } catch {}
+          if (++n > 40) { try { if (suppressRetry) { clearInterval(suppressRetry); suppressRetry = null; } } catch {} }
+        }, 2500);
+      }
+      logger.info("voice suppression/agc/echo forced OFF on " + mods.length + " module(s)");
+    } catch (e) { try { logger.info("suppression off failed " + e); } catch {} }
+  };
+  const stopSuppression = () => { for (const u of suppressUnpatch) { try { u(); } catch {} } suppressUnpatch.length = 0; if (suppressRetry) { try { clearInterval(suppressRetry); } catch {} suppressRetry = null; } };
+
   // Bridge to the full-feature Fiona app: it serves EVERY parameter + the
   // soundboard on localhost, the plugin polls and applies them live.
   let bridgeTimer = null; let bridgeOk = false; let lastPlayNow = "";
@@ -596,6 +647,7 @@ plugin = (() => {
       try { patchMicSettings(); } catch (e) { try { logger.info("mic patch failed " + e); } catch {} }
       try { createFloating(); } catch (e) { try { logger.info("floating failed " + e); } catch {} }
       try { hookSpeaking(); } catch (e) { try { logger.info("speaking failed " + e); } catch {} }
+      try { forceSuppressionOff(); } catch (e) { try { logger.info("suppression init failed " + e); } catch {} }
       try { syncFionaFromStore(); } catch {}
       try { updateFionaNode(); } catch {}
       try { logger.info("Fiona Audio ready — slider " + cfg().slider); } catch {}
@@ -606,6 +658,7 @@ plugin = (() => {
       if (floatingRetry) { try { clearInterval(floatingRetry); } catch {} floatingRetry = null; }
       try { stopBridge(); } catch {}
       try { stopSpeaking(); } catch {}
+      try { stopSuppression(); } catch {}
       if (fluxUnsub) try { fluxUnsub(); } catch {} fluxUnsub = null;
       for (const r of saveOrig) try { r(); } catch {} saveOrig.length = 0;
       if (gumPatched && nativeGUM) { try { const nav = (typeof navigator !== 'undefined' ? navigator : null) ?? window?.navigator ?? global?.navigator ?? null; if (nav?.mediaDevices) nav.mediaDevices.getUserMedia = nativeGUM; } catch {} nativeGUM = null; gumPatched = false; }
