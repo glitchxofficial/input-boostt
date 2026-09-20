@@ -275,16 +275,32 @@
       const E = React.createElement;
       const { View, Text, TouchableOpacity } = RN;
       let AppMod = null;
-      try { AppMod = metro.findByName("App", false); } catch {}
-      if (!AppMod) try { AppMod = metro.findByDisplayName("App"); } catch {}
+      const tryNames = ["App", "DiscordApp", "Root", "AppRoot", "Main", "Application", "NavigationContainer", "Stack", "BottomTabBar"];
+      for (const n of tryNames) {
+        try { const m = metro.findByName(n, false); if (m && m.default) { AppMod = m; break; } } catch {}
+        try { const m = metro.findByDisplayName(n); if (m && m.default) { AppMod = m; break; } } catch {}
+        try { const m = metro.findByDisplayName(n, false); if (m && m.default) { AppMod = m; break; } } catch {}
+      }
       if (!AppMod) try { AppMod = findByProps("App"); } catch {}
-      if (!AppMod || typeof AppMod.default !== "function") return false;
+      if (!AppMod) {
+        try {
+          const mods = vendetta.metro.modules ?? {};
+          for (const k in mods) {
+            const exp = mods[k]?.exports ?? mods[k];
+            if (exp && exp.default && typeof exp.default === "function") {
+              const s = String(exp.default);
+              if (s.includes("NavigationContainer") || s.includes("AppRegistry") || s.includes("renderApplication")) { AppMod = exp; break; }
+            }
+          }
+        } catch {}
+      }
+      if (!AppMod || typeof AppMod.default !== "function") { logger.info("floating: App not found"); return false; }
       const Floating = () => {
         const [, forceUpdate] = React.useReducer((x) => x + 1, 0);
         const slider = cfg().slider;
         const [open, setOpen] = React.useState(false);
         const SliderComp = (() => { try { const m = findByProps("Slider"); return m?.Slider ?? m ?? null; } catch { return null; } })() ?? RN.Slider ?? null;
-        return E(View, { style: { position: "absolute", top: 50, right: 12, zIndex: 9999, alignItems: "flex-end" } },
+        return E(View, { style: { position: "absolute", top: 50, right: 12, zIndex: 9999, elevation: 9999, alignItems: "flex-end" }, pointerEvents: "box-none" },
           E(TouchableOpacity, { onPress: () => setOpen(!open), activeOpacity: 0.85, style: { backgroundColor: "#0a0a0f", borderWidth: 1, borderColor: "rgba(100,40,180,0.35)", borderRadius: 100, paddingHorizontal: 14, paddingVertical: 10, flexDirection: "row", alignItems: "center" } },
             E(View, { style: { width: 10, height: 10, borderRadius: 5, backgroundColor: cfg().enabled ? "#7a3adf" : "rgba(100,40,180,0.3)", marginRight: 8 } }),
             E(Text, { style: { color: "#fff", fontWeight: "700", fontSize: 12 } }, "Fiona"),
@@ -299,7 +315,7 @@
         );
       };
       const undo = patcher.after("default", AppMod, (args, ret) => {
-        try { return E(View, { style: { flex: 1 } }, ret, E(Floating, null)); } catch { return ret; }
+        try { return E(View, { style: { flex: 1 }, pointerEvents: "box-none" }, ret, E(Floating, null)); } catch { return ret; }
       });
       if (undo) { patches.push(undo); logger.info("floating Fiona injected"); return true; }
     } catch (e) { logger.info("floating failed " + e); }
