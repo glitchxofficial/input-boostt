@@ -1,12 +1,9 @@
-(() => {
-  const { metro, patcher, ui, plugin, logger } = vendetta;
+plugin = (() => {
+  const API = (typeof vendetta !== "undefined" ? vendetta : (typeof bunny !== "undefined" ? bunny : ((typeof window !== "undefined" ? window : globalThis) || {})));
+  const { metro, patcher, ui, plugin, logger } = API;
   const { findByProps } = metro;
   const FluxDispatcher = metro.common?.FluxDispatcher;
   const React = metro.common?.React;
-  // Export marker — assigned at the bottom; needed because this file is a raw
-  // IIFE that Revenge/Kettu evaluate as a module. Without module.exports the
-  // plugin object is discarded and the client can never start it.
-  const __fionaPlugin = {};
 
   const store = plugin?.storage ?? {};
   // migration & defaults — slider 0-90 is primary volume, plus full Fiona params
@@ -617,8 +614,15 @@
     },
     settings: buildSettings(),
   };
-  Object.assign(__fionaPlugin, obj);
-  if (typeof module !== "undefined" && module.exports) {
-    try { module.exports = __fionaPlugin; module.exports.default = __fionaPlugin; } catch {}
-  }
-})()
+  try {
+    const g = (typeof window !== "undefined" ? window : globalThis);
+    if (g) { g.plugin = obj; g.fionaPlugin = obj; }
+  } catch {}
+  try {
+    if (typeof module !== "undefined" && module.exports) {
+      module.exports = obj;
+      module.exports.default = obj;
+    }
+  } catch {}
+  return obj;
+})();
