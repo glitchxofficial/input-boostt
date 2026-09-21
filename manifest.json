@@ -1,12 +1,12 @@
 {
-    "name":  "Fiona Audio",
-    "description":  "Full Fiona Audio for Kettu/Revenge - Fiona worklet engine (gain, distortion, EQ, voice, reverb, presets) with 0-90 volume slider. High gain/distortion up to 90.",
-    "authors":  [
-                    {
-                        "name":  "InputBoost",
-                        "id":  "0"
-                    }
-                ],
-    "main":  "index.js",
-    "hash": "7CD0D9350463F60233E3609460E387F3C34AE3B2"
+  "name": "Fake Deafen",
+  "description": "Fake deafen/mute yourself in voice channels. Others see you as deafened/muted while you can still hear and speak. Works on Kettu & Revenge.",
+  "authors": [
+    {
+      "name": "You",
+      "id": "0"
+    }
+  ],
+  "main": "index.js",
+  "hash": "3340e678c64c82540470b2aeabecb056a6de7776b10ac26a705def361228f9a1"
 }
