@@ -6,7 +6,7 @@ plugin = (() => {
   const React = metro.common?.React;
 
   const store = plugin?.storage ?? {};
-  // migration & defaults — slider 0-90 is primary volume, plus full Fiona params
+  // migration & defaults - slider 0-90 is primary volume, plus full Fiona params
   if (store.gain == null) store.gain = 90;
   if (store.masterGain == null) store.masterGain = 0;
   if (store.inputBoost == null) store.inputBoost = 0;
@@ -226,10 +226,10 @@ plugin = (() => {
     } catch (e) { logger.info("gum patch failed " + e); return false; }
   };
 
-  let patches = []; let fluxUnsub = null; const saveOrig = []; let voiceRetry = null;
+  let patches = []; let fluxUnsub = null; const saveOrig = []; let voiceRetry = null; let gumRetry = null;
 
   // The client's native voice pipeline keeps its own suppression/echo/AGC on
-  // even when our processed stream is injected — that chops the boosted mic.
+  // even when our processed stream is injected - that chops the boosted mic.
   // Finds VoiceEngine-style modules and forces those flags OFF, keeping them off.
   const SUPPRESSION_METHODS = ["setNoiseSuppression","setNoiseSuppressionEnabled","setNoiseSuppressionDisabled","setNoiseCancellation","setNoiseCancellationEnabled","setEnableNoiseSuppression","setEnableNoiseCancellation","setEchoCancellation","setEchoCancellationEnabled","setEnableEchoCancellation","setAutoGainControl","setAutomaticGain","setAgcEnabled","setEnableAutoGainControl"];
   const suppressUnpatch = []; let suppressRetry = null;
@@ -301,7 +301,7 @@ plugin = (() => {
           if (typeof j[k] === "string" && j[k] && store[k] !== j[k]) { store[k] = j[k]; changed = true; }
         }
         if (Array.isArray(j.sounds) && JSON.stringify(j.sounds) !== JSON.stringify(store.sounds || [])) { store.sounds = j.sounds; changed = true; }
-        if (!bridgeOk) { bridgeOk = true; logger.info("Fiona app bridge connected — " + BRIDGE_INTS.length + "+ params"); }
+        if (!bridgeOk) { bridgeOk = true; logger.info("Fiona app bridge connected - " + BRIDGE_INTS.length + "+ params"); }
         if (changed) { syncFionaFromStore(); updateFionaNode(); }
         if (typeof j.playNow === "string" && j.playNow) {
           if (lastPlayNow !== j.playNow) { lastPlayNow = j.playNow; playSound(j.playNow); }
@@ -409,7 +409,7 @@ plugin = (() => {
       if (!safe) { enc.channels = cfg().stereo ? 2 : 1; enc.rate = 48000; }
       const params = { ...enc.params, usedtx: "0", useinbandfec: "0", maxaveragebitrate: String(bitrate) };
       if (cfg().stereo) params.stereo = "1";
-      // zeroing nr/ns/agc can break transmission on some builds — only when safe mode is off
+      // zeroing nr/ns/agc can break transmission on some builds - only when safe mode is off
       if (!safe && cfg().raw) { const off = ["nr","ns","agc","aec","cn","tx","highpass"]; for (const k of off) params[k] = "0"; }
       enc.params = params;
     }
@@ -436,7 +436,7 @@ plugin = (() => {
           const mkSwitch = (title, key) => E(Forms.FormSwitchRow ?? Forms.FormRow, { label: title, value: !!store[key], onValueChange: (v) => { store[key] = !!v; syncFionaFromStore(); updateFionaNode(); forceUpdate(); } });
           const sliderEl = SliderComp ? E(RN.View, { style: { paddingHorizontal: 16, paddingVertical: 8 } }, E(RN.Text, { style: { color: "#fff", marginBottom: 8, fontWeight: "700" } }, "Volume: " + slider + " / 90 (" + (slider/10).toFixed(1) + "x) - " + (cfg().clear ? "CLEAN" : "DISTORTED")), E(SliderComp, { value: slider, minimumValue: 0, maximumValue: 90, step: 1, onValueChange: (v) => { const nv = Array.isArray(v) ? v[0] : v; store.gain = Math.max(0, Math.min(90, Math.round(Number(nv)))); syncFionaFromStore(); updateFionaNode(); forceUpdate(); } })) : E(Forms.FormRow, { label: `Volume: ${slider}/90` });
           const Section = Forms.FormSection || (({ children, title }) => E(RN.View, null, title ? E(RN.Text, { style: { fontWeight: "700", padding: 16 } }, title) : null, children));
-          return E(Section, { title: "Fiona Audio — Mic" }, mkSwitch("Boost enabled", "enabled"), mkSwitch("Safe mode", "safe"), mkSwitch("Clear audio", "clear"), sliderEl, E(Forms.FormRow, { label: "Open full Fiona panel in Plugins → Fiona Audio" }));
+          return E(Section, { title: "Fiona Audio - Mic" }, mkSwitch("Boost enabled", "enabled"), mkSwitch("Safe mode", "safe"), mkSwitch("Clear audio", "clear"), sliderEl, E(Forms.FormRow, { label: "Open full Fiona panel in Plugins -> Fiona Audio" }));
         }
         const makeSection = () => E(BoostSection, null);
         const candidates = []; const tryFind = (fn) => { try { const r = fn(); if (r) candidates.push(r); } catch {} };
@@ -494,18 +494,41 @@ plugin = (() => {
         const [, forceUpdate] = React.useReducer((x) => x + 1, 0);
         const slider = cfg().slider;
         const [open, setOpen] = React.useState(false);
+        const [pos, setPos] = React.useState(null); // {top, left} once dragged
         const SliderComp = (() => { try { const m = findByProps("Slider"); return m?.Slider ?? m ?? null; } catch { return null; } })() ?? RN.Slider ?? null;
-        return E(View, { style: { position: "absolute", top: 50, right: 12, zIndex: 9999, elevation: 9999, alignItems: "flex-end" }, pointerEvents: "box-none" },
-          E(TouchableOpacity, { onPress: () => setOpen(!open), activeOpacity: 0.85, style: { backgroundColor: "#0a0a0f", borderWidth: 1, borderColor: "rgba(100,40,180,0.35)", borderRadius: 100, paddingHorizontal: 14, paddingVertical: 10, flexDirection: "row", alignItems: "center" } },
-            E(View, { style: { width: 10, height: 10, borderRadius: 5, backgroundColor: cfg().enabled ? "#7a3adf" : "rgba(100,40,180,0.3)", marginRight: 8 } }),
+        // movable menu: drag the grip to reposition, tap to open/close
+        const Pan = (() => { try { return RN.PanResponder ?? null; } catch { return null; } })();
+        const dragRef = React.useRef({ x: 0, y: 0, moved: false, base: null });
+        const handlers = Pan ? Pan.create({
+          onStartShouldSetPanResponder: () => true,
+          onMoveShouldSetPanResponder: (evt, g) => Math.abs(g.dx) > 4 || Math.abs(g.dy) > 4,
+          onPanResponderGrant: (evt, g) => {
+            dragRef.current.x = evt.nativeEvent.pageX;
+            dragRef.current.y = evt.nativeEvent.pageY;
+            dragRef.current.moved = false;
+            dragRef.current.base = pos;
+          },
+          onPanResponderMove: (evt, g) => {
+            if (Math.abs(g.dx) > 6 || Math.abs(g.dy) > 6) dragRef.current.moved = true;
+            const base = dragRef.current.base || pos || {};
+            setPos({ top: Math.max(20, (base.top ?? 50) + g.dy), left: null, right: (base.right ?? 12) - g.dx });
+          },
+          onPanResponderRelease: () => { dragRef.current.moved = false; }
+        }).panHandlers : null;
+        const pillStyle = { position: "absolute", zIndex: 9999, elevation: 9999, alignItems: "flex-end", pointerEvents: "box-none", top: (pos?.top ?? 50), right: (pos?.right ?? 12) };
+        const grip = handlers ? { ...handlers } : {};
+        const onTap = () => { if (dragRef.current.moved) return; setOpen(!open); };
+        return E(View, { style: pillStyle },
+          E(TouchableOpacity, { onPress: onTap, ...grip, activeOpacity: 0.85, style: { backgroundColor: "#0f0f14", borderWidth: 1, borderColor: "rgba(110,80,200,0.4)", borderRadius: 100, paddingHorizontal: 14, paddingVertical: 12, flexDirection: "row", alignItems: "center" } },
+            E(View, { style: { width: 10, height: 10, borderRadius: 5, backgroundColor: cfg().enabled ? "#7a5adf" : "rgba(110,80,200,0.3)", marginRight: 8 } }),
             E(Text, { style: { color: "#fff", fontWeight: "700", fontSize: 12 } }, "Fiona mic"),
-            E(Text, { style: { color: "rgba(180,130,255,0.7)", fontSize: 10, marginLeft: 8 } }, slider + "/90")
+            E(Text, { style: { color: "rgba(180,150,255,0.7)", fontSize: 10, marginLeft: 8 } }, slider + "/90")
           ),
-          open ? E(View, { style: { marginTop: 8, width: 300, backgroundColor: "#0d0d1a", borderWidth: 1, borderColor: "rgba(100,40,180,0.2)", borderRadius: 16, padding: 12 } },
-            E(Text, { style: { color: "#c8aaff", fontWeight: "700", fontSize: 13, marginBottom: 10 } }, "Fiona mic  same colours"),
-            SliderComp ? E(View, { style: { marginBottom: 10 } }, E(Text, { style: { color: "#fff", marginBottom: 6, fontSize: 12 } }, "Volume: " + slider + " / 90"), E(SliderComp, { value: slider, minimumValue: 0, maximumValue: 90, step: 1, onValueChange: (v) => { const nv = Array.isArray(v) ? v[0] : v; store.gain = Math.max(0, Math.min(90, Math.round(Number(nv)))); syncFionaFromStore(); updateFionaNode(); forceUpdate(); } })) : E(Text, { style: { color: "#fff" } }, "Volume " + slider + "/90"),
-            E(TouchableOpacity, { onPress: () => { store.clear = !store.clear; syncFionaFromStore(); updateFionaNode(); forceUpdate(); }, style: { backgroundColor: store.clear ? "rgba(100,40,180,0.25)" : "#1a1a2a", borderWidth: 1, borderColor: store.clear ? "rgba(100,40,180,0.5)" : "rgba(100,40,180,0.15)", borderRadius: 8, padding: 10, alignItems: "center", marginTop: 6 } }, E(Text, { style: { color: store.clear ? "#c8aaff" : "#aaa", fontWeight: "600" } }, store.clear ? "Clear: ON" : "Clear: OFF")),
-            E(TouchableOpacity, { onPress: () => { store.enabled = !store.enabled; syncFionaFromStore(); updateFionaNode(); forceUpdate(); }, style: { backgroundColor: cfg().enabled ? "rgba(100,40,180,0.2)" : "#222", borderWidth: 1, borderColor: "rgba(100,40,180,0.2)", borderRadius: 8, padding: 10, alignItems: "center", marginTop: 6 } }, E(Text, { style: { color: cfg().enabled ? "#c8aaff" : "#888" } }, cfg().enabled ? "Boost: ON" : "Boost: OFF"))
+          open ? E(View, { style: { marginTop: 10, width: 300, backgroundColor: "#12121a", borderWidth: 1, borderColor: "rgba(110,80,200,0.25)", borderRadius: 18, padding: 14 } },
+            E(Text, { style: { color: "#c8aaff", fontWeight: "700", fontSize: 13, marginBottom: 12 } }, "Fiona mic - drag to move"),
+            SliderComp ? E(View, { style: { marginBottom: 12 } }, E(Text, { style: { color: "#fff", marginBottom: 6, fontSize: 12 } }, "Volume: " + slider + " / 90"), E(SliderComp, { value: slider, minimumValue: 0, maximumValue: 90, step: 1, onValueChange: (v) => { const nv = Array.isArray(v) ? v[0] : v; store.gain = Math.max(0, Math.min(90, Math.round(Number(nv)))); syncFionaFromStore(); updateFionaNode(); forceUpdate(); } })) : E(Text, { style: { color: "#fff" } }, "Volume " + slider + "/90"),
+            E(TouchableOpacity, { onPress: () => { store.clear = !store.clear; syncFionaFromStore(); updateFionaNode(); forceUpdate(); }, style: { backgroundColor: store.clear ? "rgba(110,80,200,0.25)" : "#1a1a26", borderWidth: 1, borderColor: store.clear ? "rgba(110,80,200,0.5)" : "rgba(110,80,200,0.15)", borderRadius: 8, padding: 10, alignItems: "center", marginTop: 6 } }, E(Text, { style: { color: store.clear ? "#c8aaff" : "#aaa", fontWeight: "600" } }, store.clear ? "Clear: ON" : "Clear: OFF")),
+            E(TouchableOpacity, { onPress: () => { store.enabled = !store.enabled; syncFionaFromStore(); updateFionaNode(); forceUpdate(); }, style: { backgroundColor: cfg().enabled ? "rgba(110,80,200,0.2)" : "#222", borderWidth: 1, borderColor: "rgba(110,80,200,0.2)", borderRadius: 8, padding: 10, alignItems: "center", marginTop: 6 } }, E(Text, { style: { color: cfg().enabled ? "#c8aaff" : "#888" } }, cfg().enabled ? "Boost: ON" : "Boost: OFF"))
           ) : null
         );
       };
@@ -524,7 +547,7 @@ plugin = (() => {
     } catch (e) { logger.info("floating failed " + e); return false; }
     };
     if (tryPatch()) return true;
-    // App module loads lazily — retry for 30s so floating appears even if enabled before first render
+    // App module loads lazily - retry for 30s so floating appears even if enabled before first render
     let attempts = 0;
     if (floatingRetry) try { clearInterval(floatingRetry); } catch {}
     floatingRetry = setInterval(() => {
@@ -545,7 +568,7 @@ plugin = (() => {
           return () => {
             const [, fu] = React.useReducer((x) => x + 1, 0);
             const mkSw = (t, k) => E(View, { style: { flexDirection: "row", justifyContent: "space-between", padding: 12 } }, E(Text, { style: { color: "#fff" } }, t), E(Switch, { value: !!store[k], onValueChange: (v) => { store[k] = !!v; syncFionaFromStore(); updateFionaNode(); fu(); } }));
-            return E(ScrollView, null, E(Text, { style: { color: "#fff", padding: 16, fontWeight: "700" } }, `Fiona Audio — slider ${cfg().slider}/90`), mkSw("Boost", "enabled"), mkSw("Clear", "clear"));
+            return E(ScrollView, null, E(Text, { style: { color: "#fff", padding: 16, fontWeight: "700" } }, `Fiona Audio - slider ${cfg().slider}/90`), mkSw("Boost", "enabled"), mkSw("Clear", "clear"));
           };
         }
         return () => null;
@@ -585,12 +608,12 @@ plugin = (() => {
           const reverbOpts = ["hall", "room", "plate", "cathedral"];
           pane = E(RN?.View ?? "View", null,
             E(FormRow, { label: "Voice Type", trailing: E(RN?.Text ?? "Text", { style: { color: "#7af" } }, String(store.voiceChanger)) }),
-            ...voiceOpts.map((v) => E(FormRow, { key: v, label: v, trailing: E(RN?.View ?? "View", { style: { backgroundColor: store.voiceChanger === v ? "#7a3adf" : "#333", borderRadius: 6, padding: 6 } }, E(RN?.Text ?? "Text", { style: { color: "#fff" }, onPress: () => { store.voiceChanger = v; syncFionaFromStore(); updateFionaNode(); forceUpdate(); } }, v === store.voiceChanger ? "✓" : "○")) })),
+            ...voiceOpts.map((v) => E(FormRow, { key: v, label: v, trailing: E(RN?.View ?? "View", { style: { backgroundColor: store.voiceChanger === v ? "#7a3adf" : "#333", borderRadius: 6, padding: 6 } }, E(RN?.Text ?? "Text", { style: { color: "#fff" }, onPress: () => { store.voiceChanger = v; syncFionaFromStore(); updateFionaNode(); forceUpdate(); } }, v === store.voiceChanger ? "[x]" : "[ ]")) })),
             E(FormRow, { label: "Voice Profile", trailing: E(RN?.Text ?? "Text", { style: { color: "#7af" } }, String(store.voiceProfile)) }),
-            ...profileOpts.map((p) => E(FormRow, { key: p, label: p, trailing: E(RN?.View ?? "View", { style: { backgroundColor: store.voiceProfile === p ? "#7a3adf" : "#333", borderRadius: 6, padding: 6 } }, E(RN?.Text ?? "Text", { style: { color: "#fff" }, onPress: () => { store.voiceProfile = p; const prof = VOICE_PROFILES[p]; if (prof) { Object.keys(prof).forEach((k) => { store[k] = prof[k]; }); } syncFionaFromStore(); updateFionaNode(); forceUpdate(); } }, p === store.voiceProfile ? "✓" : "○")) })),
+            ...profileOpts.map((p) => E(FormRow, { key: p, label: p, trailing: E(RN?.View ?? "View", { style: { backgroundColor: store.voiceProfile === p ? "#7a3adf" : "#333", borderRadius: 6, padding: 6 } }, E(RN?.Text ?? "Text", { style: { color: "#fff" }, onPress: () => { store.voiceProfile = p; const prof = VOICE_PROFILES[p]; if (prof) { Object.keys(prof).forEach((k) => { store[k] = prof[k]; }); } syncFionaFromStore(); updateFionaNode(); forceUpdate(); } }, p === store.voiceProfile ? "[x]" : "[ ]")) })),
             mkSlider("pitch", "Pitch", 0, 100, store.pitch), mkSlider("formant", "Formant", 50, 200, store.formant), mkSlider("distortion", "Distortion", 0, 100, store.distortion), mkSlider("reverb", "Reverb", 0, 100, store.reverb),
             E(FormRow, { label: "Reverb Type", trailing: E(RN?.Text ?? "Text", { style: { color: "#7af" } }, String(store.reverbType)) }),
-            ...reverbOpts.map((r) => E(FormRow, { key: r, label: "   " + r, trailing: E(RN?.View ?? "View", { style: { backgroundColor: store.reverbType === r ? "#7a3adf" : "#333", borderRadius: 6, padding: 6 } }, E(RN?.Text ?? "Text", { style: { color: "#fff" }, onPress: () => { store.reverbType = r; syncFionaFromStore(); updateFionaNode(); forceUpdate(); } }, store.reverbType === r ? "✓" : "○")) }))
+            ...reverbOpts.map((r) => E(FormRow, { key: r, label: "   " + r, trailing: E(RN?.View ?? "View", { style: { backgroundColor: store.reverbType === r ? "#7a3adf" : "#333", borderRadius: 6, padding: 6 } }, E(RN?.Text ?? "Text", { style: { color: "#fff" }, onPress: () => { store.reverbType = r; syncFionaFromStore(); updateFionaNode(); forceUpdate(); } }, store.reverbType === r ? "[x]" : "[ ]")) }))
           );
         } else if (tab === "advanced") {
           pane = E(RN?.View ?? "View", null,
@@ -613,7 +636,7 @@ plugin = (() => {
           };
           const doPlay = (s) => { const ok = playSound(s.url); if (!ok) { try { const L = findByProps("Linking"); const link = L?.default ?? L?.Linking; if (link?.openURL) link.openURL(s.url); } catch {} } };
           pane = E(RN?.View ?? "View", null,
-            E(T, { style: { paddingHorizontal: 16, paddingTop: 8, color: "#aaa" } }, "Soundboard: add sound URLs, then tap ▶ to play, or SPEAK to auto-play when you talk (must enable 'Play sound when I speak')."),
+            E(T, { style: { paddingHorizontal: 16, paddingTop: 8, color: "#aaa" } }, "Soundboard: add sound URLs, then tap play to play, or SPEAK to auto-play when you talk (must enable 'Play sound when I speak')."),
             TextInput ? E(RN?.View ?? "View", { style: { paddingHorizontal: 16 } },
               E(TextInput, { placeholder: "Sound name", placeholderTextColor: "#777", style: { color: "#fff", backgroundColor: "#1a1a2a", borderRadius: 8, padding: 10, marginTop: 6 }, value: soundName, onChangeText: setSoundName }),
               E(TextInput, { placeholder: "https://example.com/sound.mp3", placeholderTextColor: "#777", style: { color: "#fff", backgroundColor: "#1a1a2a", borderRadius: 8, padding: 10, marginTop: 6 }, value: soundUrl, onChangeText: setSoundUrl }),
@@ -621,15 +644,15 @@ plugin = (() => {
             ) : null,
             ...(store.sounds || []).map((s, i) => E(FormRow, { key: i, label: s.name || s.url,
               trailing: E(RN?.View ?? "View", { style: { flexDirection: "row", alignItems: "center" } },
-                E(RN?.Text ?? "Text", { style: { color: "#7af", marginRight: 10 }, onPress: () => doPlay(s) }, "▶"),
+                E(RN?.Text ?? "Text", { style: { color: "#7af", marginRight: 10 }, onPress: () => doPlay(s) }, "play"),
                 E(RN?.Text ?? "Text", { style: { color: s.speak ? "#7a3adf" : "#777", marginRight: 10 }, onPress: () => { s.speak = !s.speak; syncFionaFromStore(); forceUpdate(); } }, s.speak ? "SPEAK ON" : "speak"),
-                E(RN?.Text ?? "Text", { style: { color: "#f66" }, onPress: () => { (store.sounds || []).splice(i, 1); syncFionaFromStore(); forceUpdate(); } }, "✕"))
+                E(RN?.Text ?? "Text", { style: { color: "#f66" }, onPress: () => { (store.sounds || []).splice(i, 1); syncFionaFromStore(); forceUpdate(); } }, "x"))
             }))
           );
         }
 
         return E(RN?.ScrollView ? RN.ScrollView : RN?.View ?? "View", { style: { flex: 1 } },
-          E(Section, { title: "Fiona Audio — Full" }, E(T, { style: { paddingHorizontal: 16, paddingTop: 8, color: "#aaa" } }, `Fiona worklet ${gumPatched ? "ACTIVE" : "fallback"} — slider ${cfg().slider}/90`)),
+          E(Section, { title: "Fiona Audio - Full" }, E(T, { style: { paddingHorizontal: 16, paddingTop: 8, color: "#aaa" } }, `Fiona worklet ${gumPatched ? "ACTIVE" : "fallback"} - slider ${cfg().slider}/90`)),
           E(TabBar, null),
           pane
         );
@@ -641,6 +664,15 @@ plugin = (() => {
     onLoad() {
       try { logger.info("Fiona Audio plugin starting"); } catch {}
       try { patchGetUserMedia(); } catch (e) { try { logger.info("gum failed " + e); } catch {} }
+      // getUserMedia may only appear after the client boots voice - keep trying
+      if (!gumPatched) {
+        let gumTries = 0;
+        try {
+          gumRetry = setInterval(() => {
+            try { if (patchGetUserMedia() || ++gumTries > 45) { try { clearInterval(gumRetry); } catch {} gumRetry = null; } } catch {}
+          }, 1000);
+        } catch {}
+      }
       try { startBridge(); } catch (e) { try { logger.info("bridge start failed " + e); } catch {} }
       try { hookTransport(); } catch (e) { try { logger.info("transport failed " + e); } catch {} }
       try { hookFlux(); } catch (e) { try { logger.info("flux failed " + e); } catch {} }
@@ -650,12 +682,13 @@ plugin = (() => {
       try { forceSuppressionOff(); } catch (e) { try { logger.info("suppression init failed " + e); } catch {} }
       try { syncFionaFromStore(); } catch {}
       try { updateFionaNode(); } catch {}
-      try { logger.info("Fiona Audio ready — slider " + cfg().slider); } catch {}
+      try { logger.info("Fiona Audio ready - slider " + cfg().slider); } catch {}
     },
     onUnload() {
       for (const u of patches) try { u(); } catch {}
       patches = []; if (voiceRetry) { try { clearInterval(voiceRetry); } catch {} voiceRetry = null; }
       if (floatingRetry) { try { clearInterval(floatingRetry); } catch {} floatingRetry = null; }
+      if (gumRetry) { try { clearInterval(gumRetry); } catch {} gumRetry = null; }
       try { stopBridge(); } catch {}
       try { stopSpeaking(); } catch {}
       try { stopSuppression(); } catch {}
